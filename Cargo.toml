@@ -6,8 +6,8 @@ members = ["crates/*"]
 version = "0.1.4"
 edition = "2021"
 license = "MIT"
-authors = ["Trong Nguyen"]
-repository = "https://github.com/nguyenphutrong/intl-lens"
+authors = ["Scope i18n Lens Contributors"]
+repository = "https://github.com/BigHuang/scope-i18n-lens"
 
 [workspace.dependencies]
 tower-lsp = "0.20"
@@ -19,6 +19,7 @@ tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+json5 = "0.4"
 
 # Logging
 tracing = "0.1"

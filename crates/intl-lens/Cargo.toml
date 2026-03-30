@@ -1,12 +1,12 @@
 [package]
-name = "intl-lens"
+name = "scope-i18n-lens"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
 [[bin]]
-name = "intl-lens"
+name = "scope-i18n-lens"
 path = "src/main.rs"
 
 [dependencies]
@@ -15,6 +15,7 @@ tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
+json5.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true

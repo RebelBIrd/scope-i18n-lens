@@ -1,10 +1,15 @@
 use zed_extension_api::{self as zed, LanguageServerId, Result, Worktree};
 
-struct IntlLensExtension {
+const PRIMARY_BINARY_NAME: &str = "scope-i18n-lens";
+const LEGACY_BINARY_NAME: &str = "intl-lens";
+const PRIMARY_REPOSITORY: &str = "BigHuang/scope-i18n-lens";
+const LEGACY_REPOSITORY: &str = "nguyenphutrong/intl-lens";
+
+struct ScopeI18nLensExtension {
     cached_binary_path: Option<String>,
 }
 
-impl zed::Extension for IntlLensExtension {
+impl zed::Extension for ScopeI18nLensExtension {
     fn new() -> Self {
         Self {
             cached_binary_path: None,
@@ -26,7 +31,7 @@ impl zed::Extension for IntlLensExtension {
     }
 }
 
-impl IntlLensExtension {
+impl ScopeI18nLensExtension {
     fn get_server_binary_path(
         &mut self,
         language_server_id: &LanguageServerId,
@@ -38,7 +43,12 @@ impl IntlLensExtension {
             }
         }
 
-        if let Some(path) = worktree.which("intl-lens") {
+        if let Some(path) = worktree.which(PRIMARY_BINARY_NAME) {
+            self.cached_binary_path = Some(path.clone());
+            return Ok(path);
+        }
+
+        if let Some(path) = worktree.which(LEGACY_BINARY_NAME) {
             self.cached_binary_path = Some(path.clone());
             return Ok(path);
         }
@@ -48,42 +58,57 @@ impl IntlLensExtension {
             &zed::LanguageServerInstallationStatus::CheckingForUpdate,
         );
 
-        let release = zed::latest_github_release(
-            "nguyenphutrong/intl-lens",
-            zed::GithubReleaseOptions {
-                require_assets: true,
-                pre_release: false,
-            },
-        )?;
+        let release = zed::latest_github_release(PRIMARY_REPOSITORY, Self::release_options())
+            .or_else(|_| zed::latest_github_release(LEGACY_REPOSITORY, Self::release_options()))?;
 
         let (platform, arch) = zed::current_platform();
-        let asset_name = format!(
-            "intl-lens-{}-{}.{}",
-            match arch {
-                zed::Architecture::Aarch64 => "aarch64",
-                zed::Architecture::X8664 => "x86_64",
-                zed::Architecture::X86 => "x86",
-            },
-            match platform {
-                zed::Os::Mac => "apple-darwin",
-                zed::Os::Linux => "unknown-linux-gnu",
-                zed::Os::Windows => "pc-windows-msvc",
-            },
-            match platform {
-                zed::Os::Windows => "zip",
-                _ => "tar.gz",
-            }
-        );
+        let platform_suffix = match platform {
+            zed::Os::Mac => "apple-darwin",
+            zed::Os::Linux => "unknown-linux-gnu",
+            zed::Os::Windows => "pc-windows-msvc",
+        };
+        let arch_suffix = match arch {
+            zed::Architecture::Aarch64 => "aarch64",
+            zed::Architecture::X8664 => "x86_64",
+            zed::Architecture::X86 => "x86",
+        };
+        let archive_ext = match platform {
+            zed::Os::Windows => "zip",
+            _ => "tar.gz",
+        };
+
+        let candidate_asset_names = [
+            format!(
+                "{}-{}-{}.{}",
+                PRIMARY_BINARY_NAME, arch_suffix, platform_suffix, archive_ext
+            ),
+            format!(
+                "{}-{}-{}.{}",
+                LEGACY_BINARY_NAME, arch_suffix, platform_suffix, archive_ext
+            ),
+        ];
 
         let asset = release
             .assets
             .iter()
-            .find(|asset| asset.name == asset_name)
-            .ok_or_else(|| format!("no asset found matching {asset_name}"))?;
+            .find(|asset| candidate_asset_names.iter().any(|name| name == &asset.name))
+            .ok_or_else(|| {
+                format!(
+                    "no release asset found for platform (expected one of: {})",
+                    candidate_asset_names.join(", ")
+                )
+            })?;
 
-        let version_dir = format!("intl-lens-{}", release.version);
+        let binary_name = if asset.name.starts_with(PRIMARY_BINARY_NAME) {
+            PRIMARY_BINARY_NAME
+        } else {
+            LEGACY_BINARY_NAME
+        };
+
+        let version_dir = format!("{}-{}", binary_name, release.version);
         let binary_path = format!(
-            "{version_dir}/intl-lens{}",
+            "{version_dir}/{}{}",
+            binary_name,
             match platform {
                 zed::Os::Windows => ".exe",
                 _ => "",
@@ -109,6 +134,13 @@ impl IntlLensExtension {
         self.cached_binary_path = Some(binary_path.clone());
         Ok(binary_path)
     }
+
+    fn release_options() -> zed::GithubReleaseOptions {
+        zed::GithubReleaseOptions {
+            require_assets: true,
+            pre_release: false,
+        }
+    }
 }
 
-zed::register_extension!(IntlLensExtension);
+zed::register_extension!(ScopeI18nLensExtension);

@@ -1,5 +1,5 @@
 [package]
-name = "intl-lens-extension"
+name = "scope-i18n-lens-extension"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

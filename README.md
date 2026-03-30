@@ -1,14 +1,14 @@
 <div align="center">
 
-# 🔍 Intl Lens
+# 🔍 Scope i18n Lens
 
-**i18n support for Zed Editor - see translations inline.**
+**Monorepo-aware i18n support for Zed Editor - see translations inline by package scope.**
 
 [![Rust](https://img.shields.io/badge/rust-1.70+-orange.svg)](https://www.rust-lang.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Zed](https://img.shields.io/badge/zed-extension-purple.svg)](https://zed.dev)
 
-Stop guessing what `t("common.buttons.submit")` means.<br/>
+Stop guessing what `t("common.buttons.submit")` means in large monorepos.<br/>
 **See translations inline. Catch missing keys instantly. Ship with confidence.**
 
 [Features](#-features) · [Install](#-installation) · [Configure](#-configuration) · [Contribute](#-contributing)
@@ -59,16 +59,16 @@ ja: 送信 (↗)
 
 1. Open Zed
 2. Go to Extensions (`cmd+shift+x`)
-3. Search for "Intl Lens"
+3. Search for "Scope i18n Lens"
 4. Click Install
 
 ### Build from Source
 
 ```bash
-git clone https://github.com/nguyenphutrong/intl-lens.git
-cd intl-lens
-cargo build --release -p intl-lens
-ln -sf $(pwd)/target/release/intl-lens ~/.local/bin/
+git clone https://github.com/BigHuang/scope-i18n-lens.git
+cd scope-i18n-lens
+cargo build --release -p scope-i18n-lens
+ln -sf $(pwd)/target/release/scope-i18n-lens ~/.local/bin/
 ```
 
 ### Configure Zed (Manual Installation)
@@ -78,16 +78,16 @@ Add to `~/.config/zed/settings.json`:
 ```jsonc
 {
   "lsp": {
-    "intl-lens": {
-      "binary": { "path": "intl-lens" }
+    "scope-i18n-lens": {
+      "binary": { "path": "scope-i18n-lens" }
     }
   },
   "languages": {
     "TSX": {
-      "language_servers": ["typescript-language-server", "intl-lens", "..."]
+      "language_servers": ["typescript-language-server", "scope-i18n-lens", "..."]
     },
     "TypeScript": {
-      "language_servers": ["typescript-language-server", "intl-lens", "..."]
+      "language_servers": ["typescript-language-server", "scope-i18n-lens", "..."]
     }
   }
 }
@@ -131,8 +131,11 @@ Create `.zed/i18n.json` in your project root:
 
 ```json
 {
-  "localePaths": ["src/locales", "public/locales"],
-  "sourceLocale": "en"
+  "localeDirNames": ["locales", "src/locales"],
+  "locales": ["zh-CN", "zh-HK", "en"],
+  "sourceLocale": "en",
+  "displayLocale": "en",
+  "functionNames": ["t", "tt"]
 }
 ```
 
@@ -141,23 +144,23 @@ Create `.zed/i18n.json` in your project root:
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `localePaths` | `string[]` | `["locales", "i18n", ...]` | Where to find translation files |
+| `localeDirNames` | `string[]` | `["locales"]` | Locale directory names searched upward inside package boundary |
+| `locales` | `string[]` | `["zh-CN", "zh-HK", "en"]` | Locale list used by hover/diagnostics/completion |
 | `sourceLocale` | `string` | `"en"` | Your primary language |
-| `keyStyle` | `"nested" \| "flat"` | `"auto"` | JSON structure style |
-| `functionPatterns` | `string[]` | See below | Custom regex patterns |
+| `displayLocale` | `string` | `"en"` | Locale used for inlay hints and completion details |
+| `keyStyle` | `"nested" \| "flat"` | `"flat"` | Translation key style |
+| `functionNames` | `string[]` | `["t", "tt"]` | Function names to detect as translation calls |
+| `monorepoDetectors` | `string[]` | `["yarn.lock", "pnpm-workspace.yaml", "lerna.json"]` | Stop markers when package root is missing |
+| `maxWalkDepth` | `number` | `10` | Safety limit for upward directory traversal |
 
 </details>
 
 <details>
-<summary><strong>🔧 Custom Function Patterns</strong></summary>
+<summary><strong>🔧 Custom Function Names</strong></summary>
 
 ```json
 {
-  "functionPatterns": [
-    "t\\s*\\(\\s*[\"']([^\"']+)[\"']",
-    "translate\\s*\\(\\s*[\"']([^\"']+)[\"']",
-    "i18n\\.get\\s*\\(\\s*[\"']([^\"']+)[\"']"
-  ]
+  "functionNames": ["t", "tt", "translate"]
 }
 ```
 
@@ -208,7 +211,7 @@ cargo build         # Debug build
 cargo build -r      # Release build
 
 # Run with debug logging
-RUST_LOG=debug ./target/release/intl-lens
+RUST_LOG=debug ./target/release/scope-i18n-lens
 ```
 
 ## 🤝 Contributing
@@ -239,6 +242,6 @@ MIT © [Trong Nguyen](https://github.com/nguyenphutrong)
 
 **If this project helps you, consider giving it a ⭐**
 
-[Report Bug](https://github.com/nguyenphutrong/intl-lens/issues) · [Request Feature](https://github.com/nguyenphutrong/intl-lens/issues)
+[Report Bug](https://github.com/BigHuang/scope-i18n-lens/issues) · [Request Feature](https://github.com/BigHuang/scope-i18n-lens/issues)
 
 </div>

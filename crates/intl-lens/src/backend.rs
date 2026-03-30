@@ -1,6 +1,8 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use regex::Regex;
 use tokio::sync::RwLock;
 
 use tower_lsp::jsonrpc::Result;
@@ -9,7 +11,7 @@ use tower_lsp::{Client, LanguageServer};
 
 use crate::config::I18nConfig;
 use crate::document::DocumentStore;
-use crate::i18n::{KeyFinder, TranslationStore};
+use crate::i18n::{KeyFinder, LocaleResolver, TranslationStore};
 
 fn truncate_string(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
@@ -25,6 +27,7 @@ pub struct I18nBackend {
     config: Arc<RwLock<I18nConfig>>,
     documents: Arc<RwLock<DocumentStore>>,
     translation_store: Arc<RwLock<Option<TranslationStore>>>,
+    locale_resolver: Arc<RwLock<Option<LocaleResolver>>>,
     key_finder: Arc<RwLock<KeyFinder>>,
     workspace_root: Arc<RwLock<Option<PathBuf>>>,
     inlay_hint_dynamic_registration_supported: Arc<RwLock<bool>>,
@@ -40,6 +43,7 @@ impl I18nBackend {
             config: Arc::new(RwLock::new(I18nConfig::default())),
             documents: Arc::new(RwLock::new(DocumentStore::new())),
             translation_store: Arc::new(RwLock::new(None)),
+            locale_resolver: Arc::new(RwLock::new(None)),
             key_finder: Arc::new(RwLock::new(KeyFinder::default())),
             workspace_root: Arc::new(RwLock::new(None)),
             inlay_hint_dynamic_registration_supported: Arc::new(RwLock::new(false)),
@@ -53,35 +57,25 @@ impl I18nBackend {
         tracing::info!("Initializing workspace at {:?}", root);
 
         let config = I18nConfig::load_from_workspace(&root);
-        tracing::info!("Config loaded, locale_paths: {:?}", config.locale_paths);
+        let key_finder = KeyFinder::new(&config.function_names);
+        let store = TranslationStore::new();
+        let resolver = LocaleResolver::new(config.clone());
 
-        let key_finder = KeyFinder::new(&config.function_patterns);
         *self.key_finder.write().await = key_finder;
-
-        let store = TranslationStore::new(root.clone());
-        store.scan_and_load(&config.locale_paths);
-
-        let locales = store.get_locales();
-        let keys = store.get_all_keys();
-
-        tracing::info!("Found {} locales: {:?}", locales.len(), locales);
-        tracing::info!("Found {} translation keys", keys.len());
+        *self.translation_store.write().await = Some(store);
+        *self.locale_resolver.write().await = Some(resolver);
+        *self.config.write().await = config.clone();
+        *self.workspace_root.write().await = Some(root.clone());
 
         self.client
             .log_message(
                 MessageType::INFO,
                 format!(
-                    "i18n-lsp initialized: {} locales, {} keys in {:?}",
-                    locales.len(),
-                    keys.len(),
-                    root
+                    "scope-i18n-lens initialized: localeDirs={:?}, locales={:?}",
+                    config.locale_dir_names, config.locales
                 ),
             )
             .await;
-
-        *self.translation_store.write().await = Some(store);
-        *self.config.write().await = config;
-        *self.workspace_root.write().await = Some(root);
     }
 
     async fn register_inlay_hint_capability(&self) {
@@ -113,36 +107,6 @@ impl I18nBackend {
                 scheme: None,
                 pattern: None,
             },
-            DocumentFilter {
-                language: Some("html".to_string()),
-                scheme: None,
-                pattern: None,
-            },
-            DocumentFilter {
-                language: Some("angular".to_string()),
-                scheme: None,
-                pattern: None,
-            },
-            DocumentFilter {
-                language: Some("php".to_string()),
-                scheme: None,
-                pattern: None,
-            },
-            DocumentFilter {
-                language: Some("blade".to_string()),
-                scheme: None,
-                pattern: None,
-            },
-            DocumentFilter {
-                language: Some("dart".to_string()),
-                scheme: None,
-                pattern: None,
-            },
-            DocumentFilter {
-                language: Some("vue".to_string()),
-                scheme: None,
-                pattern: None,
-            },
         ]);
 
         let register_options = InlayHintRegistrationOptions {
@@ -154,7 +118,7 @@ impl I18nBackend {
                 document_selector,
             },
             static_registration_options: StaticRegistrationOptions {
-                id: Some("intl-lens-inlay-hint".to_string()),
+                id: Some("scope-i18n-lens-inlay-hint".to_string()),
             },
         };
 
@@ -170,7 +134,7 @@ impl I18nBackend {
         };
 
         let registration = Registration {
-            id: "intl-lens-inlay-hint".to_string(),
+            id: "scope-i18n-lens-inlay-hint".to_string(),
             method: "textDocument/inlayHint".to_string(),
             register_options: Some(register_options),
         };
@@ -192,19 +156,10 @@ impl I18nBackend {
             return;
         }
 
-        let locale_paths = { self.config.read().await.locale_paths.clone() };
         let workspace_root = { self.workspace_root.read().await.clone() };
         let relative_pattern_support = *self.watched_files_relative_pattern_supported.read().await;
-
-        let watchers = Self::build_file_watchers(
-            &locale_paths,
-            workspace_root.as_deref(),
-            relative_pattern_support,
-        );
-        if watchers.is_empty() {
-            tracing::debug!("Skipping watched files registration (no locale paths)");
-            return;
-        }
+        let watchers =
+            Self::build_file_watchers(workspace_root.as_deref(), relative_pattern_support);
 
         let register_options = DidChangeWatchedFilesRegistrationOptions { watchers };
         let register_options = match serde_json::to_value(register_options) {
@@ -219,7 +174,7 @@ impl I18nBackend {
         };
 
         let registration = Registration {
-            id: "intl-lens-watched-files".to_string(),
+            id: "scope-i18n-lens-watched-files".to_string(),
             method: "workspace/didChangeWatchedFiles".to_string(),
             register_options: Some(register_options),
         };
@@ -230,19 +185,48 @@ impl I18nBackend {
         }
     }
 
+    async fn ensure_locale_dir_for_uri(&self, uri: &Url) -> Option<PathBuf> {
+        let file_path = uri.to_file_path().ok()?;
+
+        let resolution = {
+            let mut resolver_guard = self.locale_resolver.write().await;
+            let resolver = resolver_guard.as_mut()?;
+            resolver.resolve_locale_dir(&file_path)
+        }?;
+
+        let config = self.config.read().await.clone();
+
+        {
+            let store_guard = self.translation_store.read().await;
+            let store = store_guard.as_ref()?;
+
+            if !store.is_locale_dir_loaded(&resolution.locale_dir) {
+                store.load_locale_dir(&resolution.locale_dir, &config.locales, config.key_style);
+            }
+        }
+
+        Some(resolution.locale_dir)
+    }
+
     async fn diagnose_document(&self, uri: &Url, content: &str) {
-        let diagnostics = self.compute_diagnostics(content).await;
+        let diagnostics = self.compute_diagnostics(uri, content).await;
 
         self.client
             .publish_diagnostics(uri.clone(), diagnostics, None)
             .await;
     }
 
-    async fn compute_diagnostics(&self, content: &str) -> Vec<Diagnostic> {
+    async fn compute_diagnostics(&self, uri: &Url, content: &str) -> Vec<Diagnostic> {
+        let locale_dir = match self.ensure_locale_dir_for_uri(uri).await {
+            Some(locale_dir) => locale_dir,
+            None => return vec![],
+        };
+
         let key_finder = self.key_finder.read().await;
         let found_keys = key_finder.find_keys(content);
 
         let translation_store = self.translation_store.read().await;
+        let config = self.config.read().await;
 
         let Some(store) = translation_store.as_ref() else {
             return vec![];
@@ -251,106 +235,93 @@ impl I18nBackend {
         let mut diagnostics = Vec::new();
 
         for found_key in found_keys {
-            if !store.key_exists(&found_key.key) {
+            let range = Range {
+                start: Position {
+                    line: found_key.line as u32,
+                    character: found_key.start_char as u32,
+                },
+                end: Position {
+                    line: found_key.line as u32,
+                    character: found_key.end_char as u32,
+                },
+            };
+
+            if !store.key_exists(&locale_dir, &found_key.key) {
                 diagnostics.push(Diagnostic {
-                    range: Range {
-                        start: Position {
-                            line: found_key.line as u32,
-                            character: found_key.start_char as u32,
-                        },
-                        end: Position {
-                            line: found_key.line as u32,
-                            character: found_key.end_char as u32,
-                        },
-                    },
-                    severity: Some(DiagnosticSeverity::WARNING),
+                    range,
+                    severity: Some(DiagnosticSeverity::ERROR),
                     code: Some(NumberOrString::String("missing-translation".to_string())),
-                    source: Some("i18n".to_string()),
-                    message: format!("Translation key '{}' not found", found_key.key),
+                    source: Some("scope-i18n-lens".to_string()),
+                    message: format!(
+                        "Translation key '{}' not found in current package locales",
+                        found_key.key
+                    ),
                     ..Default::default()
                 });
-            } else {
-                let missing_locales = store.get_missing_locales(&found_key.key);
-                if !missing_locales.is_empty() {
-                    diagnostics.push(Diagnostic {
-                        range: Range {
-                            start: Position {
-                                line: found_key.line as u32,
-                                character: found_key.start_char as u32,
-                            },
-                            end: Position {
-                                line: found_key.line as u32,
-                                character: found_key.end_char as u32,
-                            },
-                        },
-                        severity: Some(DiagnosticSeverity::HINT),
-                        code: Some(NumberOrString::String("incomplete-translation".to_string())),
-                        source: Some("i18n".to_string()),
-                        message: format!(
-                            "Translation '{}' missing in: {}",
-                            found_key.key,
-                            missing_locales.join(", ")
-                        ),
-                        ..Default::default()
-                    });
-                }
+                continue;
+            }
+
+            let missing_locales =
+                store.get_missing_locales(&locale_dir, &found_key.key, &config.locales);
+            if !missing_locales.is_empty() {
+                diagnostics.push(Diagnostic {
+                    range,
+                    severity: Some(DiagnosticSeverity::WARNING),
+                    code: Some(NumberOrString::String("incomplete-translation".to_string())),
+                    source: Some("scope-i18n-lens".to_string()),
+                    message: format!(
+                        "Translation '{}' missing in: {}",
+                        found_key.key,
+                        missing_locales.join(", ")
+                    ),
+                    ..Default::default()
+                });
             }
         }
 
         diagnostics
     }
 
-    async fn get_hover_content(&self, key: &str) -> Option<String> {
+    async fn get_hover_content(&self, locale_dir: &Path, key: &str) -> Option<String> {
         let translation_store = self.translation_store.read().await;
         let config = self.config.read().await;
         let store = translation_store.as_ref()?;
 
-        let translations = store.get_all_translations(key);
+        let translations = store.get_all_translations(locale_dir, key);
         if translations.is_empty() {
             return None;
         }
 
-        let mut content = format!("### 🌍 `{}`\n\n", key);
+        let mut content = String::new();
+        content.push_str(key);
+        content.push_str("\n\n");
 
-        let source_locale = &config.source_locale;
-        let format_line = |locale: &str| -> Option<String> {
-            let entry = translations.get(locale)?;
-            let mut line = format!("**{}**: {}", locale, entry.value);
-
-            if let Some(location) = store.get_translation_location(key, locale) {
-                if let Ok(uri) = Url::from_file_path(&location.file_path) {
-                    let link = format!("{}#L{}", uri, location.line + 1);
-                    line.push_str(&format!(" ([↗]({} \"Go to Definition\"))", link));
-                }
-            }
-
-            line.push_str("\n\n");
-            Some(line)
-        };
-
-        if let Some(line) = format_line(source_locale) {
-            content.push_str(&line);
+        for locale in &config.locales {
+            let value = translations
+                .get(locale)
+                .map(|entry| entry.value.clone())
+                .unwrap_or_else(|| "missing".to_string());
+            content.push_str(&format!("{}: {}\n", locale, value));
         }
 
-        content.push_str("---\n\n");
+        if let Some(source_location) =
+            store.get_translation_location(locale_dir, key, &config.source_locale)
+        {
+            content.push_str("\n");
+            content.push_str(&format!("Path: {}\n", source_location.file_path.display()));
+        }
 
-        let mut other_locales: Vec<String> = translations
-            .keys()
-            .filter(|locale| *locale != source_locale)
-            .cloned()
-            .collect();
-        other_locales.sort();
-
-        for locale in other_locales {
-            if let Some(line) = format_line(&locale) {
-                content.push_str(&line);
-            }
+        let placeholders =
+            Self::collect_placeholders(translations.values().map(|entry| entry.value.as_str()));
+        if !placeholders.is_empty() {
+            content.push_str("\n");
+            content.push_str(&format!("Placeholders: {}\n", placeholders.join(", ")));
         }
 
         Some(content)
     }
 
-    async fn get_completions(&self, prefix: &str) -> Vec<CompletionItem> {
+    async fn get_completions(&self, locale_dir: &Path, prefix: &str) -> Vec<CompletionItem> {
         let translation_store = self.translation_store.read().await;
         let config = self.config.read().await;
 
@@ -358,15 +329,22 @@ impl I18nBackend {
             return vec![];
         };
 
-        let all_keys = store.get_all_keys();
-        let source_locale = &config.source_locale;
+        let display_locale = &config.display_locale;
+        let mut keys = store.get_all_keys(locale_dir);
+        keys.sort();
 
-        all_keys
+        let mut ranked: Vec<(u8, String)> = keys
             .into_iter()
-            .filter(|key| key.starts_with(prefix) || prefix.is_empty())
+            .filter_map(|key| Self::score_key_match(&key, prefix).map(|score| (score, key)))
+            .collect();
+
+        ranked.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+
+        ranked
+            .into_iter()
             .take(100)
-            .map(|key| {
-                let translation = store.get_translation(&key, source_locale);
+            .map(|(_, key)| {
+                let translation = store.get_translation(locale_dir, &key, display_locale);
                 CompletionItem {
                     label: key.clone(),
                     kind: Some(CompletionItemKind::TEXT),
@@ -374,130 +352,37 @@ impl I18nBackend {
                     documentation: translation.map(|t| {
                         Documentation::MarkupContent(MarkupContent {
                             kind: MarkupKind::Markdown,
-                            value: format!("**{}**: {}", source_locale, t),
+                            value: format!("**{}**: {}", display_locale, t),
                         })
                     }),
-                    insert_text: Some(key.clone()),
+                    insert_text: Some(key),
                     ..Default::default()
                 }
             })
             .collect()
     }
 
-    fn build_file_watchers(
-        locale_paths: &[String],
-        workspace_root: Option<&Path>,
-        relative_pattern_support: bool,
-    ) -> Vec<FileSystemWatcher> {
-        let mut patterns = Vec::new();
+    async fn get_definition_location(&self, locale_dir: &Path, key: &str) -> Option<Location> {
+        let translation_store = self.translation_store.read().await;
+        let config = self.config.read().await;
+        let store = translation_store.as_ref()?;
 
-        for locale_path in locale_paths {
-            let trimmed = locale_path.trim_end_matches(['/', '\\']);
-            if trimmed.is_empty() {
-                continue;
-            }
+        let location = store.get_translation_location(locale_dir, key, &config.source_locale)?;
+        let uri = Url::from_file_path(&location.file_path).ok()?;
 
-            if Self::is_translation_file_path(trimmed) {
-                patterns.push(trimmed.to_string());
-                continue;
-            }
-
-            for extension in Self::translation_extensions() {
-                patterns.push(format!("{}/**/*{}", trimmed, extension));
-            }
-        }
-
-        patterns.sort();
-        patterns.dedup();
-
-        let base_uri = if relative_pattern_support {
-            workspace_root.and_then(|root| Url::from_directory_path(root).ok())
-        } else {
-            None
-        };
-
-        patterns
-            .into_iter()
-            .map(|pattern| {
-                let glob_pattern = if let Some(base_uri) = base_uri.clone() {
-                    GlobPattern::Relative(RelativePattern {
-                        base_uri: OneOf::Right(base_uri),
-                        pattern,
-                    })
-                } else if let Some(root) = workspace_root {
-                    GlobPattern::String(Self::to_absolute_pattern(root, &pattern))
-                } else {
-                    GlobPattern::String(pattern)
-                };
-
-                FileSystemWatcher {
-                    glob_pattern,
-                    kind: None,
-                }
-            })
-            .collect()
-    }
-
-    fn to_absolute_pattern(root: &Path, pattern: &str) -> String {
-        let mut root_str = root.to_string_lossy().replace('\\', "/");
-        root_str = root_str.trim_end_matches('/').to_string();
-
-        if pattern.is_empty() {
-            return root_str;
-        }
-
-        if pattern.starts_with('/') {
-            format!("{}{}", root_str, pattern)
-        } else {
-            format!("{}/{}", root_str, pattern)
-        }
-    }
-
-    fn translation_extensions() -> [&'static str; 5] {
-        [".json", ".yaml", ".yml", ".php", ".arb"]
-    }
-
-    fn has_translation_extension(path: &Path) -> bool {
-        let lower = path.to_string_lossy().to_ascii_lowercase();
-        Self::translation_extensions()
-            .iter()
-            .any(|extension| lower.ends_with(extension))
-    }
-
-    fn is_translation_file_path(path: &str) -> bool {
-        let lower = path.to_ascii_lowercase();
-        Self::translation_extensions()
-            .iter()
-            .any(|extension| lower.ends_with(extension))
-    }
-
-    fn is_translation_file_in_paths(path: &Path, root: &Path, locale_paths: &[String]) -> bool {
-        if !Self::has_translation_extension(path) {
-            return false;
-        }
-
-        for locale_path in locale_paths {
-            let trimmed = locale_path.trim_end_matches(['/', '\\']);
-            if trimmed.is_empty() {
-                continue;
-            }
-
-            let candidate = if Path::new(trimmed).is_absolute() {
-                PathBuf::from(trimmed)
-            } else {
-                root.join(trimmed)
-            };
-
-            if candidate.is_file() {
-                if path == candidate {
-                    return true;
-                }
-            } else if path.starts_with(&candidate) {
-                return true;
-            }
-        }
-
-        false
+        Some(Location {
+            uri,
+            range: Range {
+                start: Position {
+                    line: location.line as u32,
+                    character: location.column as u32,
+                },
+                end: Position {
+                    line: location.line as u32,
+                    character: location.column as u32,
+                },
+            },
+        })
     }
 
     async fn is_translation_uri(&self, uri: &Url) -> bool {
@@ -505,43 +390,63 @@ impl I18nBackend {
             return false;
         };
 
-        let workspace_root = { self.workspace_root.read().await.clone() };
-        let locale_paths = { self.config.read().await.locale_paths.clone() };
+        if !Self::has_translation_extension(&path) {
+            return false;
+        }
 
-        let Some(root) = workspace_root.as_ref() else {
+        let store_guard = self.translation_store.read().await;
+        let Some(store) = store_guard.as_ref() else {
             return false;
         };
 
-        Self::is_translation_file_in_paths(&path, root, &locale_paths)
+        store
+            .get_loaded_locale_dirs()
+            .into_iter()
+            .any(|locale_dir| path.starts_with(locale_dir))
     }
 
-    async fn reload_translations(&self) {
-        let workspace_root = { self.workspace_root.read().await.clone() };
-        let locale_paths = { self.config.read().await.locale_paths.clone() };
-
-        let Some(root) = workspace_root.as_ref() else {
+    async fn reload_changed_files(&self, params: &DidChangeWatchedFilesParams) {
+        let config = self.config.read().await.clone();
+        let store_guard = self.translation_store.read().await;
+        let Some(store) = store_guard.as_ref() else {
             return;
         };
 
-        let store = TranslationStore::new(root.clone());
-        store.scan_and_load(&locale_paths);
+        let mut reloaded = false;
 
-        let locales = store.get_locales();
-        let keys = store.get_all_keys();
+        for change in &params.changes {
+            let Some(path) = change.uri.to_file_path().ok() else {
+                continue;
+            };
 
-        self.client
-            .log_message(
-                MessageType::INFO,
-                format!(
-                    "Reloaded translations: {} locales, {} keys",
-                    locales.len(),
-                    keys.len()
-                ),
-            )
-            .await;
+            if !Self::has_translation_extension(&path) {
+                continue;
+            }
 
-        *self.translation_store.write().await = Some(store);
-        self.refresh_inlay_hints().await;
+            if store.reload_for_changed_file(&path, &config.locales, config.key_style) {
+                reloaded = true;
+            }
+        }
+
+        drop(store_guard);
+
+        if reloaded {
+            self.refresh_inlay_hints().await;
+            self.rediagnose_open_documents().await;
+        }
+    }
+
+    async fn rediagnose_open_documents(&self) {
+        let docs = self.documents.read().await;
+        let snapshot = docs.snapshot();
+        drop(docs);
+
+        for (uri, content) in snapshot {
+            let Ok(uri) = Url::parse(&uri) else {
+                continue;
+            };
+            self.diagnose_document(&uri, &content).await;
+        }
     }
 
     async fn refresh_inlay_hints(&self) {
@@ -552,61 +457,163 @@ impl I18nBackend {
         }
     }
 
-    async fn get_definition_locations(&self, key: &str) -> Vec<Location> {
-        let translation_store = self.translation_store.read().await;
-        let config = self.config.read().await;
-        let Some(store) = translation_store.as_ref() else {
-            return Vec::new();
+    fn build_file_watchers(
+        workspace_root: Option<&Path>,
+        relative_pattern_support: bool,
+    ) -> Vec<FileSystemWatcher> {
+        let pattern = "**/*.json".to_string();
+
+        let glob_pattern = if relative_pattern_support {
+            if let Some(root) = workspace_root {
+                if let Ok(base_uri) = Url::from_directory_path(root) {
+                    GlobPattern::Relative(RelativePattern {
+                        base_uri: OneOf::Right(base_uri),
+                        pattern,
+                    })
+                } else {
+                    GlobPattern::String("**/*.json".to_string())
+                }
+            } else {
+                GlobPattern::String("**/*.json".to_string())
+            }
+        } else if let Some(root) = workspace_root {
+            GlobPattern::String(Self::to_absolute_pattern(root, "**/*.json"))
+        } else {
+            GlobPattern::String("**/*.json".to_string())
         };
 
-        let translations = store.get_all_translations(key);
-        if translations.is_empty() {
-            return Vec::new();
+        vec![FileSystemWatcher {
+            glob_pattern,
+            kind: None,
+        }]
+    }
+
+    fn to_absolute_pattern(root: &Path, pattern: &str) -> String {
+        let mut root_str = root.to_string_lossy().replace('\\', "/");
+        root_str = root_str.trim_end_matches('/').to_string();
+
+        if pattern.starts_with('/') {
+            format!("{}{}", root_str, pattern)
+        } else {
+            format!("{}/{}", root_str, pattern)
         }
+    }
 
-        let source_locale = &config.source_locale;
-        let mut other_locales: Vec<String> = translations
-            .keys()
-            .filter(|locale| *locale != source_locale)
-            .cloned()
-            .collect();
-        other_locales.sort();
+    fn has_translation_extension(path: &Path) -> bool {
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+    }
 
-        let mut locales = Vec::new();
-        if translations.contains_key(source_locale) {
-            locales.push(source_locale.clone());
-        }
-        locales.extend(other_locales);
+    fn extract_completion_prefix(
+        line: &str,
+        character: usize,
+        function_names: &[String],
+    ) -> Option<String> {
+        let before_cursor = &line[..character.min(line.len())];
+        let mut best_match: Option<(usize, String)> = None;
 
-        let mut locations = Vec::new();
-        for locale in locales {
-            if let Some(location) = store.get_translation_location(key, &locale) {
-                if let Ok(uri) = Url::from_file_path(&location.file_path) {
-                    locations.push(Location {
-                        uri,
-                        range: Range {
-                            start: Position {
-                                line: location.line as u32,
-                                character: 0,
-                            },
-                            end: Position {
-                                line: location.line as u32,
-                                character: 0,
-                            },
-                        },
-                    });
+        for function_name in function_names {
+            for quote in ['"', '\''] {
+                let marker = format!("{}({}", function_name, quote);
+                let mut search_start = before_cursor.len();
+
+                while search_start > 0 {
+                    let Some(pos) = before_cursor[..search_start].rfind(&marker) else {
+                        break;
+                    };
+
+                    let is_member_call =
+                        before_cursor[..pos].chars().next_back().is_some_and(|ch| {
+                            ch.is_ascii_alphanumeric() || ch == '_' || ch == '.' || ch == '$'
+                        });
+                    if is_member_call {
+                        search_start = pos;
+                        continue;
+                    }
+
+                    let after_quote = pos + marker.len();
+                    let prefix = &before_cursor[after_quote..];
+                    if !prefix.contains(quote) {
+                        let candidate = (pos, prefix.to_string());
+                        let should_replace = match best_match.as_ref() {
+                            Some(current) => candidate.0 > current.0,
+                            None => true,
+                        };
+                        if should_replace {
+                            best_match = Some(candidate);
+                        }
+                    }
+
+                    break;
                 }
             }
         }
 
-        locations
+        best_match.map(|(_, prefix)| prefix)
+    }
+
+    fn score_key_match(key: &str, prefix: &str) -> Option<u8> {
+        if prefix.is_empty() {
+            return Some(0);
+        }
+
+        let key_lower = key.to_ascii_lowercase();
+        let prefix_lower = prefix.to_ascii_lowercase();
+
+        if key_lower.starts_with(&prefix_lower) {
+            return Some(0);
+        }
+
+        if key_lower.contains(&prefix_lower) {
+            return Some(1);
+        }
+
+        if Self::is_subsequence(&prefix_lower, &key_lower) {
+            return Some(2);
+        }
+
+        None
+    }
+
+    fn is_subsequence(needle: &str, haystack: &str) -> bool {
+        let mut needle_chars = needle.chars();
+        let mut current = needle_chars.next();
+
+        if current.is_none() {
+            return true;
+        }
+
+        for ch in haystack.chars() {
+            if Some(ch) == current {
+                current = needle_chars.next();
+                if current.is_none() {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    fn collect_placeholders<'a>(values: impl Iterator<Item = &'a str>) -> Vec<String> {
+        let regex = Regex::new(r"\{[A-Za-z0-9_]+\}").expect("placeholder regex should compile");
+        let mut placeholders = BTreeSet::new();
+
+        for value in values {
+            for capture in regex.find_iter(value) {
+                placeholders.insert(capture.as_str().to_string());
+            }
+        }
+
+        placeholders.into_iter().collect()
     }
 }
 
 #[tower_lsp::async_trait]
 impl LanguageServer for I18nBackend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
-        tracing::info!("i18n-lsp initialize called");
+        tracing::info!("scope-i18n-lens initialize called");
         tracing::debug!("Client capabilities: {:?}", params.capabilities);
 
         let inlay_hint_dynamic_registration_support = params
@@ -651,23 +658,6 @@ impl LanguageServer for I18nBackend {
         *self.watched_files_relative_pattern_supported.write().await =
             watched_files_relative_pattern_support;
 
-        tracing::info!(
-            "Client inlay hint dynamicRegistration: {}",
-            inlay_hint_dynamic_registration_support
-        );
-        tracing::info!(
-            "Client inlay hint refreshSupport: {}",
-            inlay_hint_refresh_supported
-        );
-        tracing::info!(
-            "Client didChangeWatchedFiles dynamicRegistration: {}",
-            watched_files_dynamic_registration_support
-        );
-        tracing::info!(
-            "Client didChangeWatchedFiles relativePatternSupport: {}",
-            watched_files_relative_pattern_support
-        );
-
         let root_path = params
             .workspace_folders
             .as_ref()
@@ -701,11 +691,7 @@ impl LanguageServer for I18nBackend {
                 )),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 completion_provider: Some(CompletionOptions {
-                    trigger_characters: Some(vec![
-                        "\"".to_string(),
-                        "'".to_string(),
-                        ".".to_string(),
-                    ]),
+                    trigger_characters: Some(vec!["\"".to_string(), "'".to_string()]),
                     ..Default::default()
                 }),
                 definition_provider: Some(OneOf::Left(true)),
@@ -718,7 +704,7 @@ impl LanguageServer for I18nBackend {
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
-                name: "i18n-lsp".to_string(),
+                name: "scope-i18n-lens".to_string(),
                 version: Some(env!("CARGO_PKG_VERSION").to_string()),
             }),
         })
@@ -726,7 +712,7 @@ impl LanguageServer for I18nBackend {
 
     async fn initialized(&self, _: InitializedParams) {
         self.client
-            .log_message(MessageType::INFO, "i18n-lsp server initialized")
+            .log_message(MessageType::INFO, "scope-i18n-lens server initialized")
             .await;
         self.register_inlay_hint_capability().await;
         self.register_watched_files_capability().await;
@@ -737,18 +723,7 @@ impl LanguageServer for I18nBackend {
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
-        let mut has_translation_changes = false;
-        for change in &params.changes {
-            if self.is_translation_uri(&change.uri).await {
-                has_translation_changes = true;
-                break;
-            }
-        }
-
-        if has_translation_changes {
-            tracing::info!("Translation files changed, reloading...");
-            self.reload_translations().await;
-        }
+        self.reload_changed_files(&params).await;
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
@@ -782,8 +757,13 @@ impl LanguageServer for I18nBackend {
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
         if self.is_translation_uri(&params.text_document.uri).await {
-            tracing::info!("Translation file saved, reloading...");
-            self.reload_translations().await;
+            let params = DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: params.text_document.uri,
+                    typ: FileChangeType::CHANGED,
+                }],
+            };
+            self.reload_changed_files(&params).await;
         }
     }
 
@@ -795,6 +775,11 @@ impl LanguageServer for I18nBackend {
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
+
+        let locale_dir = match self.ensure_locale_dir_for_uri(&uri).await {
+            Some(locale_dir) => locale_dir,
+            None => return Ok(None),
+        };
 
         let docs = self.documents.read().await;
         let Some(doc) = docs.get(uri.as_str()) else {
@@ -812,14 +797,14 @@ impl LanguageServer for I18nBackend {
             return Ok(None);
         };
 
-        let Some(hover_content) = self.get_hover_content(&found_key.key).await else {
+        let Some(hover_content) = self.get_hover_content(&locale_dir, &found_key.key).await else {
             return Ok(None);
         };
 
         Ok(Some(Hover {
             contents: HoverContents::Markup(MarkupContent {
                 kind: MarkupKind::Markdown,
-                value: hover_content,
+                value: format!("```text\n{}\n```", hover_content.trim_end()),
             }),
             range: None,
         }))
@@ -828,6 +813,11 @@ impl LanguageServer for I18nBackend {
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
+
+        let locale_dir = match self.ensure_locale_dir_for_uri(&uri).await {
+            Some(locale_dir) => locale_dir,
+            None => return Ok(None),
+        };
 
         let docs = self.documents.read().await;
         let Some(doc) = docs.get(uri.as_str()) else {
@@ -841,13 +831,17 @@ impl LanguageServer for I18nBackend {
             .unwrap_or("")
             .to_string();
 
-        let Some(prefix) =
-            Self::extract_completion_prefix(&line_content, position.character as usize)
-        else {
+        let function_names = self.config.read().await.function_names.clone();
+
+        let Some(prefix) = Self::extract_completion_prefix(
+            &line_content,
+            position.character as usize,
+            &function_names,
+        ) else {
             return Ok(None);
         };
 
-        let completions = self.get_completions(&prefix).await;
+        let completions = self.get_completions(&locale_dir, &prefix).await;
 
         if completions.is_empty() {
             return Ok(None);
@@ -863,6 +857,11 @@ impl LanguageServer for I18nBackend {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
 
+        let locale_dir = match self.ensure_locale_dir_for_uri(&uri).await {
+            Some(locale_dir) => locale_dir,
+            None => return Ok(None),
+        };
+
         let docs = self.documents.read().await;
         let Some(doc) = docs.get(uri.as_str()) else {
             return Ok(None);
@@ -879,27 +878,28 @@ impl LanguageServer for I18nBackend {
             return Ok(None);
         };
 
-        let locations = self.get_definition_locations(&found_key.key).await;
-        if locations.is_empty() {
+        let Some(location) = self
+            .get_definition_location(&locale_dir, &found_key.key)
+            .await
+        else {
             return Ok(None);
-        }
+        };
 
-        if locations.len() == 1 {
-            return Ok(Some(GotoDefinitionResponse::Scalar(locations[0].clone())));
-        }
-
-        Ok(Some(GotoDefinitionResponse::Array(locations)))
+        Ok(Some(GotoDefinitionResponse::Scalar(location)))
     }
 
     async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
         let uri = params.text_document.uri;
-        tracing::debug!(">>> inlay_hint: uri={}, range={:?}", uri, params.range);
 
-        let source_locale = self.config.read().await.source_locale.clone();
+        let locale_dir = match self.ensure_locale_dir_for_uri(&uri).await {
+            Some(locale_dir) => locale_dir,
+            None => return Ok(None),
+        };
+
+        let display_locale = self.config.read().await.display_locale.clone();
 
         let docs = self.documents.read().await;
         let Some(doc) = docs.get(uri.as_str()) else {
-            tracing::warn!("<<< inlay_hint: document NOT in store: {}", uri);
             return Ok(None);
         };
 
@@ -938,55 +938,81 @@ impl LanguageServer for I18nBackend {
                 continue;
             }
 
-            if let Some(translation) = store.get_translation(&found_key.key, &source_locale) {
-                let display_text = truncate_string(&translation, 30);
+            let raw_display = store
+                .get_translation(&locale_dir, &found_key.key, &display_locale)
+                .unwrap_or_else(|| found_key.key.clone());
+            let display_text = truncate_string(&raw_display, 40);
 
-                let mut hint_char = found_key.end_char;
-                if let Some(line) = content.lines().nth(found_key.line) {
-                    let line_bytes = line.as_bytes();
-                    if matches!(line_bytes.get(hint_char), Some(b'\'') | Some(b'"')) {
-                        hint_char += 1;
-                    }
+            let mut hint_char = found_key.end_char;
+            if let Some(line) = content.lines().nth(found_key.line) {
+                let line_bytes = line.as_bytes();
+                if matches!(line_bytes.get(hint_char), Some(b'\'') | Some(b'"')) {
+                    hint_char += 1;
                 }
-
-                hints.push(InlayHint {
-                    position: Position {
-                        line: found_key.line as u32,
-                        character: hint_char as u32,
-                    },
-                    label: InlayHintLabel::String(format!("= {}", display_text)),
-                    kind: Some(InlayHintKind::TYPE),
-                    text_edits: None,
-                    tooltip: None,
-                    padding_left: Some(true),
-                    padding_right: None,
-                    data: None,
-                });
             }
+
+            hints.push(InlayHint {
+                position: Position {
+                    line: found_key.line as u32,
+                    character: hint_char as u32,
+                },
+                label: InlayHintLabel::String(format!("= {}", display_text)),
+                kind: Some(InlayHintKind::TYPE),
+                text_edits: None,
+                tooltip: None,
+                padding_left: Some(true),
+                padding_right: None,
+                data: None,
+            });
         }
 
-        tracing::debug!("<<< inlay_hint: returning {} hints", hints.len());
         Ok(Some(hints))
     }
 }
 
-impl I18nBackend {
-    fn extract_completion_prefix(line: &str, character: usize) -> Option<String> {
-        let before_cursor = &line[..character.min(line.len())];
+#[cfg(test)]
+mod tests {
+    use super::I18nBackend;
 
-        let quote_patterns = ["t(\"", "t('", "$t(\"", "$t('", "i18n.t(\"", "i18n.t('"];
+    #[test]
+    fn extracts_completion_prefix_for_t_and_tt() {
+        let names = vec!["t".to_string(), "tt".to_string()];
+        let line1 = "const x = t('global_";
+        let line2 = "const x = tt(\"profile.";
+        assert_eq!(
+            I18nBackend::extract_completion_prefix(line1, line1.len(), &names),
+            Some("global_".to_string())
+        );
+        assert_eq!(
+            I18nBackend::extract_completion_prefix(line2, line2.len(), &names),
+            Some("profile.".to_string())
+        );
+    }
 
-        for pattern in quote_patterns {
-            if let Some(pos) = before_cursor.rfind(pattern) {
-                let after_quote = pos + pattern.len();
-                let prefix = &before_cursor[after_quote..];
+    #[test]
+    fn does_not_extract_completion_from_member_calls() {
+        let names = vec!["t".to_string(), "tt".to_string()];
+        let line = "const x = i18n.t('foo";
+        assert_eq!(
+            I18nBackend::extract_completion_prefix(line, line.len(), &names),
+            None
+        );
+    }
 
-                if !prefix.contains('"') && !prefix.contains('\'') {
-                    return Some(prefix.to_string());
-                }
-            }
-        }
-
-        None
+    #[test]
+    fn fuzzy_match_prefers_prefix() {
+        assert_eq!(
+            I18nBackend::score_key_match("global_cancel", "glob"),
+            Some(0)
+        );
+        assert_eq!(
+            I18nBackend::score_key_match("auth.global_cancel", "glob"),
+            Some(1)
+        );
+        assert_eq!(
+            I18nBackend::score_key_match("global_cancel", "gcn"),
+            Some(2)
+        );
+        assert_eq!(I18nBackend::score_key_match("global_cancel", "xyz"), None);
     }
 }

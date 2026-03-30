@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use dashmap::DashMap;
-use globset::Glob;
-use walkdir::WalkDir;
+
+use crate::config::KeyStyle;
 
 use super::parser::TranslationParser;
 
@@ -11,269 +11,330 @@ use super::parser::TranslationParser;
 pub struct TranslationEntry {
     pub value: String,
     pub file_path: PathBuf,
+    pub line: usize,
+    pub column: usize,
 }
 
 #[derive(Debug, Clone)]
 pub struct TranslationLocation {
     pub file_path: PathBuf,
     pub line: usize,
+    pub column: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PackageLocaleStore {
+    locales: HashMap<String, HashMap<String, TranslationEntry>>,
 }
 
 pub struct TranslationStore {
-    translations: DashMap<String, HashMap<String, TranslationEntry>>,
-    workspace_root: PathBuf,
+    packages: DashMap<PathBuf, PackageLocaleStore>,
 }
 
 impl TranslationStore {
-    pub fn new(workspace_root: PathBuf) -> Self {
+    pub fn new() -> Self {
         Self {
-            translations: DashMap::new(),
-            workspace_root,
+            packages: DashMap::new(),
         }
     }
 
-    pub fn scan_and_load(&self, locale_paths: &[String]) {
-        for locale_path in locale_paths {
-            let full_path = self.workspace_root.join(locale_path);
-            if full_path.exists() {
-                self.scan_directory(&full_path);
-            }
-        }
+    pub fn load_locale_dir(
+        &self,
+        locale_dir: &Path,
+        configured_locales: &[String],
+        key_style: KeyStyle,
+    ) {
+        let normalized = locale_dir.to_path_buf();
+        let package_store = self.build_package_store(locale_dir, configured_locales, key_style);
+        self.packages.insert(normalized, package_store);
     }
 
-    fn scan_directory(&self, dir: &Path) {
-        let json_glob = Glob::new("*.json").unwrap().compile_matcher();
-        let yaml_glob = Glob::new("*.{yaml,yml}").unwrap().compile_matcher();
-        let php_glob = Glob::new("*.php").unwrap().compile_matcher();
-        let arb_glob = Glob::new("*.arb").unwrap().compile_matcher();
-
-        for entry in WalkDir::new(dir)
-            .max_depth(3)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            let path = entry.path();
-            let file_name = path.file_name().unwrap_or_default();
-
-            if path.is_file()
-                && (json_glob.is_match(file_name)
-                    || yaml_glob.is_match(file_name)
-                    || php_glob.is_match(file_name)
-                    || arb_glob.is_match(file_name))
-            {
-                if let Some(locale) = self.extract_locale_from_path(path) {
-                    self.load_translation_file(path, &locale);
-                }
-            }
-        }
+    pub fn reload_locale_dir(
+        &self,
+        locale_dir: &Path,
+        configured_locales: &[String],
+        key_style: KeyStyle,
+    ) {
+        self.load_locale_dir(locale_dir, configured_locales, key_style);
     }
 
-    fn extract_locale_from_path(&self, path: &Path) -> Option<String> {
-        let file_stem = path.file_stem()?.to_str()?;
+    pub fn reload_for_changed_file(
+        &self,
+        changed_file: &Path,
+        configured_locales: &[String],
+        key_style: KeyStyle,
+    ) -> bool {
+        let mut affected_dirs = Vec::new();
 
-        if is_locale_code(file_stem) {
-            return Some(file_stem.to_string());
-        }
-
-        // Handle ARB naming convention: app_en.arb, app_es.arb, etc.
-        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            if ext == "arb" {
-                // Try to extract locale from patterns like "app_en" or "messages_en_US"
-                if let Some(locale) = extract_locale_from_arb_filename(file_stem) {
-                    return Some(locale);
-                }
+        for entry in self.packages.iter() {
+            let locale_dir = entry.key();
+            if changed_file.starts_with(locale_dir) {
+                affected_dirs.push(locale_dir.clone());
             }
         }
 
-        if let Some(parent) = path.parent() {
-            if let Some(parent_name) = parent.file_name().and_then(|n| n.to_str()) {
-                if is_locale_code(parent_name) {
-                    return Some(parent_name.to_string());
-                }
-            }
+        if affected_dirs.is_empty() {
+            return false;
         }
 
-        None
+        for locale_dir in affected_dirs {
+            self.reload_locale_dir(&locale_dir, configured_locales, key_style);
+        }
+
+        true
     }
 
-    fn load_translation_file(&self, path: &Path, locale: &str) {
-        match TranslationParser::parse_file(path) {
-            Ok(translations) => {
-                let mut locale_map = self.translations.entry(locale.to_string()).or_default();
-                let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                let file_stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-                let prefix =
-                    if extension == "php" && !file_stem.is_empty() && !is_locale_code(file_stem) {
-                        Some(file_stem)
-                    } else {
-                        None
-                    };
-
-                for (key, value) in translations {
-                    let full_key = match prefix {
-                        Some(prefix) => format!("{}.{}", prefix, key),
-                        None => key,
-                    };
-
-                    locale_map.insert(
-                        full_key,
-                        TranslationEntry {
-                            value,
-                            file_path: path.to_path_buf(),
-                        },
-                    );
-                }
-
-                tracing::debug!(
-                    "Loaded {} translations from {:?} for locale {}",
-                    locale_map.len(),
-                    path,
-                    locale
-                );
-            }
-            Err(e) => {
-                tracing::warn!("Failed to parse {:?}: {}", path, e);
-            }
-        }
+    pub fn get_loaded_locale_dirs(&self) -> Vec<PathBuf> {
+        self.packages
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect()
     }
 
-    pub fn get_translation(&self, key: &str, locale: &str) -> Option<String> {
-        self.translations
-            .get(locale)
-            .and_then(|map| map.get(key).map(|e| e.value.clone()))
+    pub fn is_locale_dir_loaded(&self, locale_dir: &Path) -> bool {
+        self.packages.contains_key(locale_dir)
     }
 
-    pub fn get_all_translations(&self, key: &str) -> HashMap<String, TranslationEntry> {
+    pub fn get_translation(&self, locale_dir: &Path, key: &str, locale: &str) -> Option<String> {
+        let package = self.packages.get(locale_dir)?;
+        let locale_map = package.locales.get(locale)?;
+        let entry = locale_map.get(key)?;
+        Some(entry.value.clone())
+    }
+
+    pub fn get_all_translations(
+        &self,
+        locale_dir: &Path,
+        key: &str,
+    ) -> HashMap<String, TranslationEntry> {
+        let Some(package) = self.packages.get(locale_dir) else {
+            return HashMap::new();
+        };
+
         let mut result = HashMap::new();
-        for entry in self.translations.iter() {
-            let locale = entry.key();
-            if let Some(translation) = entry.value().get(key) {
-                result.insert(locale.clone(), translation.clone());
+        for (locale, locale_map) in &package.locales {
+            if let Some(entry) = locale_map.get(key) {
+                result.insert(locale.clone(), entry.clone());
             }
         }
         result
     }
 
-    pub fn get_translation_location(&self, key: &str, locale: &str) -> Option<TranslationLocation> {
-        self.translations.get(locale).and_then(|map| {
-            map.get(key).map(|e| {
-                let line = Self::find_key_line_in_file(&e.file_path, key).unwrap_or(0);
-                TranslationLocation {
-                    file_path: e.file_path.clone(),
-                    line,
-                }
-            })
+    pub fn get_translation_location(
+        &self,
+        locale_dir: &Path,
+        key: &str,
+        locale: &str,
+    ) -> Option<TranslationLocation> {
+        let package = self.packages.get(locale_dir)?;
+        let locale_map = package.locales.get(locale)?;
+        let entry = locale_map.get(key)?;
+
+        Some(TranslationLocation {
+            file_path: entry.file_path.clone(),
+            line: entry.line,
+            column: entry.column,
         })
     }
 
-    fn find_key_line_in_file(file_path: &Path, key: &str) -> Option<usize> {
-        let content = std::fs::read_to_string(file_path).ok()?;
+    pub fn get_all_keys(&self, locale_dir: &Path) -> Vec<String> {
+        let Some(package) = self.packages.get(locale_dir) else {
+            return Vec::new();
+        };
 
-        let last_part = key.split('.').next_back().unwrap_or(key);
-        let search_patterns = [
-            format!("\"{}\"", last_part),
-            format!("'{}'", last_part),
-            format!("{}: ", last_part),
-            format!("{}:", last_part),
-        ];
-
-        for (line_num, line) in content.lines().enumerate() {
-            for pattern in &search_patterns {
-                if line.contains(pattern) {
-                    return Some(line_num);
-                }
-            }
-        }
-
-        None
-    }
-
-    pub fn get_all_keys(&self) -> Vec<String> {
-        let mut keys = std::collections::HashSet::new();
-        for entry in self.translations.iter() {
-            for key in entry.value().keys() {
+        let mut keys = HashSet::new();
+        for locale_map in package.locales.values() {
+            for key in locale_map.keys() {
                 keys.insert(key.clone());
             }
         }
         keys.into_iter().collect()
     }
 
-    pub fn get_locales(&self) -> Vec<String> {
-        self.translations.iter().map(|e| e.key().clone()).collect()
+    pub fn key_exists(&self, locale_dir: &Path, key: &str) -> bool {
+        self.packages.get(locale_dir).is_some_and(|package| {
+            package
+                .locales
+                .values()
+                .any(|locale_map| locale_map.contains_key(key))
+        })
     }
 
-    pub fn key_exists(&self, key: &str) -> bool {
-        self.translations
+    pub fn get_missing_locales(
+        &self,
+        locale_dir: &Path,
+        key: &str,
+        configured_locales: &[String],
+    ) -> Vec<String> {
+        let Some(package) = self.packages.get(locale_dir) else {
+            return configured_locales.to_vec();
+        };
+
+        configured_locales
             .iter()
-            .any(|entry| entry.value().contains_key(key))
-    }
-
-    pub fn get_missing_locales(&self, key: &str) -> Vec<String> {
-        let all_locales: Vec<String> = self.get_locales();
-        all_locales
-            .into_iter()
-            .filter(|locale| {
-                self.translations
-                    .get(locale)
-                    .map(|m| !m.contains_key(key))
-                    .unwrap_or(true)
+            .filter(|locale| match package.locales.get(*locale) {
+                Some(locale_map) => !locale_map.contains_key(key),
+                None => true,
             })
+            .cloned()
             .collect()
     }
-}
 
-fn is_locale_code(s: &str) -> bool {
-    let locale_patterns = [
-        r"^[a-z]{2}$",
-        r"^[a-z]{2}[-_][A-Z]{2}$",
-        r"^[a-z]{2}[-_][a-z]{2}$",
-    ];
+    fn build_package_store(
+        &self,
+        locale_dir: &Path,
+        configured_locales: &[String],
+        key_style: KeyStyle,
+    ) -> PackageLocaleStore {
+        let mut package_store = PackageLocaleStore::default();
 
-    for pattern in &locale_patterns {
-        if regex::Regex::new(pattern).unwrap().is_match(s) {
-            return true;
-        }
-    }
+        for locale in configured_locales {
+            let file_path = locale_dir.join(format!("{locale}.json"));
+            if !file_path.is_file() {
+                continue;
+            }
 
-    let common_locales = [
-        "en", "en-US", "en-GB", "es", "es-ES", "fr", "fr-FR", "de", "de-DE", "it", "it-IT", "pt",
-        "pt-BR", "ja", "ja-JP", "ko", "ko-KR", "zh", "zh-CN", "zh-TW", "ru", "ru-RU", "ar",
-        "ar-SA", "vi", "vi-VN",
-    ];
+            let Ok(file_content) = std::fs::read_to_string(&file_path) else {
+                tracing::warn!("Failed to read {:?}", file_path);
+                continue;
+            };
 
-    common_locales.contains(&s)
-}
+            let Ok(translations) =
+                TranslationParser::parse_json_with_key_style(&file_content, key_style)
+            else {
+                tracing::warn!("Failed to parse locale file {:?}", file_path);
+                continue;
+            };
 
-/// Extract locale from ARB filename patterns like "app_en", "messages_en_US", "intl_vi"
-fn extract_locale_from_arb_filename(file_stem: &str) -> Option<String> {
-    // Common ARB file prefixes
-    let prefixes = ["app_", "intl_", "messages_", "l10n_", "strings_"];
-
-    for prefix in prefixes {
-        if let Some(locale_part) = file_stem.strip_prefix(prefix) {
-            if is_locale_code(locale_part) {
-                return Some(locale_part.to_string());
+            let locale_map = package_store.locales.entry(locale.clone()).or_default();
+            for (key, value) in translations {
+                let (line, column) = find_key_position(&file_content, &key).unwrap_or((0, 0));
+                locale_map.insert(
+                    key,
+                    TranslationEntry {
+                        value,
+                        file_path: file_path.clone(),
+                        line,
+                        column,
+                    },
+                );
             }
         }
-    }
 
-    // Try splitting by underscore and check if last part(s) form a locale
-    let parts: Vec<&str> = file_stem.split('_').collect();
-    if parts.len() >= 2 {
-        // Try last part as locale (e.g., "app_en" -> "en")
-        let last = parts[parts.len() - 1];
-        if is_locale_code(last) {
-            return Some(last.to_string());
+        package_store
+    }
+}
+
+fn find_key_position(content: &str, key: &str) -> Option<(usize, usize)> {
+    let key_tail = key.split('.').next_back().unwrap_or(key);
+    let candidates = [key, key_tail];
+
+    for candidate in candidates {
+        let double_quote_pattern = format!("\"{candidate}\"");
+        if let Some((line, column)) = find_pattern_position(content, &double_quote_pattern) {
+            return Some((line, column + 1));
         }
 
-        // Try last two parts as locale (e.g., "app_en_US" -> "en_US")
-        if parts.len() >= 3 {
-            let locale = format!("{}_{}", parts[parts.len() - 2], parts[parts.len() - 1]);
-            if is_locale_code(&locale) {
-                return Some(locale);
-            }
+        let single_quote_pattern = format!("'{candidate}'");
+        if let Some((line, column)) = find_pattern_position(content, &single_quote_pattern) {
+            return Some((line, column + 1));
         }
     }
 
     None
+}
+
+fn find_pattern_position(content: &str, pattern: &str) -> Option<(usize, usize)> {
+    for (line_index, line) in content.lines().enumerate() {
+        if let Some(column) = line.find(pattern) {
+            return Some((line_index, column));
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::KeyStyle;
+
+    fn unique_test_root(name: &str) -> PathBuf {
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("scope_i18n_store_{name}_{pid}_{nanos}"))
+    }
+
+    fn write_file(path: &Path, content: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create parent dir");
+        }
+        std::fs::write(path, content).expect("write file");
+    }
+
+    fn cleanup_dir(path: &Path) {
+        if path.exists() {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+
+    #[test]
+    fn isolates_keys_by_locale_dir() {
+        let root = unique_test_root("isolation");
+        let crm_locale_dir = root.join("apps/crm-next/src/locales");
+        let finance_locale_dir = root.join("apps/finance-next/src/locales");
+
+        write_file(
+            &crm_locale_dir.join("en.json"),
+            r#"{"global_cancel":"Cancel","crm_only":"CRM"}"#,
+        );
+        write_file(
+            &finance_locale_dir.join("en.json"),
+            r#"{"global_cancel":"Abort","finance_only":"Finance"}"#,
+        );
+
+        let store = TranslationStore::new();
+        let locales = vec!["en".to_string()];
+        store.load_locale_dir(&crm_locale_dir, &locales, KeyStyle::Flat);
+        store.load_locale_dir(&finance_locale_dir, &locales, KeyStyle::Flat);
+
+        assert_eq!(
+            store.get_translation(&crm_locale_dir, "crm_only", "en"),
+            Some("CRM".to_string())
+        );
+        assert_eq!(
+            store.get_translation(&finance_locale_dir, "finance_only", "en"),
+            Some("Finance".to_string())
+        );
+        assert_eq!(
+            store.get_translation(&crm_locale_dir, "finance_only", "en"),
+            None
+        );
+
+        cleanup_dir(&root);
+    }
+
+    #[test]
+    fn stores_line_and_column_for_keys() {
+        let root = unique_test_root("location");
+        let locale_dir = root.join("apps/crm-next/src/locales");
+        write_file(
+            &locale_dir.join("en.json"),
+            "{\n  \"global_cancel\": \"Cancel\",\n  \"name\": \"Name\"\n}\n",
+        );
+
+        let store = TranslationStore::new();
+        let locales = vec!["en".to_string()];
+        store.load_locale_dir(&locale_dir, &locales, KeyStyle::Flat);
+
+        let location = store
+            .get_translation_location(&locale_dir, "name", "en")
+            .expect("location should exist");
+        assert_eq!(location.line, 2);
+        assert!(location.column > 0);
+
+        cleanup_dir(&root);
+    }
 }

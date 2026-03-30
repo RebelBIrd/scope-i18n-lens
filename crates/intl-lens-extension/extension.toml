@@ -1,17 +1,17 @@
-id = "intl-lens"
-name = "Intl Lens"
+id = "scope-i18n-lens"
+name = "Scope i18n Lens"
 version = "0.1.4"
 schema_version = 1
 license = "MIT"
-authors = ["Trong Nguyen"]
-description = "Internationalization (i18n) support for Zed - inline translations, hover info, and diagnostics"
-repository = "https://github.com/nguyenphutrong/intl-lens"
+authors = ["Scope i18n Lens Contributors"]
+description = "Monorepo-aware i18n support for Zed with package-scoped hints, hover, diagnostics, completion, and definition."
+repository = "https://github.com/BigHuang/scope-i18n-lens"
 
-[language_servers.intl-lens]
-name = "Intl Lens Language Server"
+[language_servers.scope-i18n-lens]
+name = "Scope i18n Lens Language Server"
 languages = ["TypeScript", "TSX", "JavaScript", "JSX", "HTML", "Angular", "PHP", "Blade", "Vue.js"]
 
-[language_servers.intl-lens.language_ids]
+[language_servers.scope-i18n-lens.language_ids]
 "TypeScript" = "typescript"
 "TSX" = "typescriptreact"
 "JavaScript" = "javascript"
