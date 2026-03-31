@@ -47,6 +47,7 @@ jobs:
       version: ${{ steps.bump.outputs.version }}
       bump_type: ${{ steps.bump.outputs.bump_type }}
       release_tag: ${{ steps.bump.outputs.release_tag }}
+      commit_sha: ${{ steps.bump.outputs.commit_sha }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -144,6 +145,7 @@ jobs:
 
           git push origin HEAD:master --follow-tags
 
+          echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "should_release=true" >> "$GITHUB_OUTPUT"
           echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
           echo "bump_type=$BUMP_TYPE" >> "$GITHUB_OUTPUT"
@@ -155,4 +157,5 @@ jobs:
     uses: ./.github/workflows/release.yml
     with:
       version: ${{ needs.bump.outputs.version }}
+      commit_sha: ${{ needs.bump.outputs.commit_sha }}
     secrets: inherit

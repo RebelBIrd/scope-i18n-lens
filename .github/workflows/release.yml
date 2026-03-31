@@ -10,6 +10,10 @@ on:
         description: Version string with or without leading v (for example 0.2.0 or v0.2.0)
         required: true
         type: string
+      commit_sha:
+        description: Commit SHA to checkout (avoids tag propagation delay)
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -86,7 +90,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.meta.outputs.tag }}
+          ref: ${{ inputs.commit_sha || needs.meta.outputs.tag }}
           fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
