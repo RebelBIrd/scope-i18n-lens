@@ -4,43 +4,89 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_call:
+    inputs:
+      version:
+        description: Version string with or without leading v (for example 0.2.0 or v0.2.0)
+        required: true
+        type: string
 
 permissions:
   contents: write
 
 env:
   CARGO_TERM_COLOR: always
+  BIN_NAME: scope-i18n-lens
+  EXTENSION_NAME: scope-i18n-lens
 
 jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - name: Resolve version and tag
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RAW_INPUT='${{ inputs.version }}'
+          RAW_REF='${GITHUB_REF_NAME}'
+
+          RAW="$RAW_INPUT"
+          if [ -z "$RAW" ]; then
+            RAW="$RAW_REF"
+          fi
+
+          RAW="${RAW#refs/tags/}"
+
+          if [[ "$RAW" =~ ^v ]]; then
+            TAG="$RAW"
+            VERSION="${RAW#v}"
+          else
+            TAG="v$RAW"
+            VERSION="$RAW"
+          fi
+
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid version: $VERSION"
+            exit 1
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build ${{ matrix.target }}
+    needs: meta
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-            name: intl-lens-x86_64-unknown-linux-gnu.tar.gz
-
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-            name: intl-lens-aarch64-unknown-linux-gnu.tar.gz
-
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            name: intl-lens-x86_64-apple-darwin.tar.gz
-
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            name: intl-lens-aarch64-apple-darwin.tar.gz
-
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            name: intl-lens-x86_64-pc-windows-msvc.zip
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+            asset_name: scope-i18n-lens-x86_64-unknown-linux-gnu.tar.gz
+          - os: macos-13
+            target: x86_64-apple-darwin
+            archive: tar.gz
+            asset_name: scope-i18n-lens-x86_64-apple-darwin.tar.gz
+          - os: macos-14
+            target: aarch64-apple-darwin
+            archive: tar.gz
+            asset_name: scope-i18n-lens-aarch64-apple-darwin.tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+            asset_name: scope-i18n-lens-x86_64-pc-windows-msvc.zip
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -50,37 +96,35 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Install cross-compilation tools (Linux ARM)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
-
-      - name: Build
-        run: cargo build --release --target ${{ matrix.target }} -p intl-lens
+      - name: Build binary
+        shell: bash
+        run: cargo build --release --target ${{ matrix.target }} -p scope-i18n-lens
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
+        shell: bash
         run: |
-          cd target/${{ matrix.target }}/release
-          tar czf ../../../${{ matrix.name }} intl-lens
-          cd ../../..
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/${BIN_NAME}" dist/
+          tar -czf "${{ matrix.asset_name }}" -C dist "${BIN_NAME}"
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
+        shell: pwsh
         run: |
-          cd target/${{ matrix.target }}/release
-          7z a ../../../${{ matrix.name }} intl-lens.exe
-          cd ../../..
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${env:BIN_NAME}.exe" "dist/${env:BIN_NAME}.exe"
+          Compress-Archive -Path "dist/${env:BIN_NAME}.exe" -DestinationPath "${{ matrix.asset_name }}" -Force
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.name }}
-          path: ${{ matrix.name }}
+          name: ${{ matrix.asset_name }}
+          path: ${{ matrix.asset_name }}
 
-  release:
-    needs: build
+  github_release:
+    name: Create GitHub Release
+    needs: [meta, build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -88,13 +132,42 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: List artifacts
-        run: ls -la artifacts/
-
-      - name: Create Release
+      - name: Create release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.meta.outputs.tag }}
+          name: ${{ needs.meta.outputs.tag }}
           files: artifacts/*
           generate_release_notes: true
           draft: false
           prerelease: false
+
+  zed_marketplace:
+    name: Publish to Zed Marketplace
+    needs: [meta, github_release]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate publish configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "${{ vars.ZED_EXTENSIONS_PUSH_TO }}" ]; then
+            echo "Missing repository variable: ZED_EXTENSIONS_PUSH_TO (for example: your-github-name/extensions)"
+            exit 1
+          fi
+
+          if [ -z "${{ secrets.COMMITTER_TOKEN }}" ]; then
+            echo "Missing secret: COMMITTER_TOKEN"
+            echo "The token must have repo and workflow scopes."
+            exit 1
+          fi
+
+      - name: Update Zed extensions registry
+        uses: huacnlee/zed-extension-action@v2
+        with:
+          extension-name: ${{ env.EXTENSION_NAME }}
+          tag: ${{ needs.meta.outputs.tag }}
+          push-to: ${{ vars.ZED_EXTENSIONS_PUSH_TO }}
+        env:
+          COMMITTER_TOKEN: ${{ secrets.COMMITTER_TOKEN }}

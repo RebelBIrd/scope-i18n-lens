@@ -2,58 +2,54 @@
 
 # 🔍 Scope i18n Lens
 
-**Monorepo-aware i18n support for Zed Editor - see translations inline by package scope.**
+**Monorepo-aware i18n support for Zed Editor — package-scoped translation hints, hover, diagnostics, and completion.**
 
 [![Rust](https://img.shields.io/badge/rust-1.70+-orange.svg)](https://www.rust-lang.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Zed](https://img.shields.io/badge/zed-extension-purple.svg)](https://zed.dev)
 
-Stop guessing what `t("common.buttons.submit")` means in large monorepos.<br/>
-**See translations inline. Catch missing keys instantly. Ship with confidence.**
-
-[Features](#-features) · [Install](#-installation) · [Configure](#-configuration) · [Contribute](#-contributing)
+Forked from [intl-lens](https://github.com/nguyenphutrong/intl-lens) with monorepo-scoped locale resolution.
 
 </div>
 
 ---
 
-## ✨ Features
+## Why this fork?
+
+The original **intl-lens** uses a single global locale path relative to the workspace root. This breaks in monorepos where each package ships its own `locales/` directory.
+
+**Scope i18n Lens** resolves translations per-package: it walks upward from the current file, finds the nearest `package.json` boundary, and looks for locale directories within that scope. Each package gets its own isolated translation context.
+
+```
+apps/
+├── web/
+│   ├── package.json        ← package boundary
+│   ├── locales/             ← translations for web
+│   │   ├── en.json
+│   │   └── zh-CN.json
+│   └── src/
+│       └── page.tsx         ← t("key") resolves from web/locales/
+├── admin/
+│   ├── package.json        ← package boundary
+│   ├── locales/             ← translations for admin
+│   └── src/
+│       └── dashboard.tsx    ← t("key") resolves from admin/locales/
+```
+
+## Features
 
 | Feature | Description |
 |---------|-------------|
-| 🔍 **Inline Hints** | See translation values right next to your i18n keys |
-| 💬 **Hover Preview** | View all locale translations with quick jump links |
-| ⚠️ **Missing Key Detection** | Get warnings for undefined translation keys |
+| 🔍 **Inline Hints** | See translation values next to i18n keys |
+| 💬 **Hover Preview** | View all locale translations with jump links |
+| ⚠️ **Missing Key Detection** | Warnings for undefined translation keys |
 | 🌐 **Incomplete Coverage** | Know which locales are missing translations |
-| ⚡ **Autocomplete** | Type `t("` and get instant key suggestions with previews |
-| 🎯 **Go to Definition** | Jump directly to the translation in any locale file |
-| 🔄 **Auto Reload** | Changes to translation files are picked up automatically |
+| ⚡ **Autocomplete** | Type `t("` and get key suggestions with previews |
+| 🎯 **Go to Definition** | Jump directly to the translation in locale files |
+| 🔄 **Auto Reload** | Translation file changes are picked up automatically |
+| 📦 **Monorepo Scoping** | Each package resolves its own locale directory |
 
-## 🎬 Demo
-
-```tsx
-// Before: What does this even mean? 🤔
-<button>{t("common.actions.submit")}</button>
-
-// After: Crystal clear! ✨
-<button>{t("common.actions.submit")}</button>  // → Submit
-```
-
-**Hover over any i18n key to see:**
-```
-🌍 common.actions.submit
-
-en: Submit (↗)
-vi: Gửi (↗)
-ja: 送信 (↗)
----
-```
-
-![Hover Preview](screenshots/screenshot-1.png)
-
-![Autocomplete](screenshots/screenshot-2-auto-compelete.png)
-
-## 🚀 Installation
+## Installation
 
 ### From Zed Extensions (Recommended)
 
@@ -65,7 +61,7 @@ ja: 送信 (↗)
 ### Build from Source
 
 ```bash
-git clone https://github.com/BigHuang/scope-i18n-lens.git
+git clone https://github.com/RebelBIrd/scope-i18n-lens.git
 cd scope-i18n-lens
 cargo build --release -p scope-i18n-lens
 ln -sf $(pwd)/target/release/scope-i18n-lens ~/.local/bin/
@@ -93,39 +89,11 @@ Add to `~/.config/zed/settings.json`:
 }
 ```
 
-**Restart Zed. Done. 🎉**
+## Supported Languages
 
-## 🎯 Supported Frameworks
+TypeScript, TSX, JavaScript, JSX, HTML, Angular, PHP, Blade, Vue.js
 
-Works out of the box with:
-
-| Framework | Patterns |
-|-----------|----------|
-| **react-i18next** | `t("key")` `useTranslation()` `<Trans i18nKey="key">` |
-| **i18next** | `t("key")` `i18n.t("key")` |
-| **vue-i18n** | `$t("key")` `t("key")` |
-| **react-intl** | `formatMessage({ id: "key" })` |
-| **ngx-translate (Angular)** | `translateService.instant("key")` `translateService.get("key")` `| translate` |
-| **Transloco (Angular)** | `translocoService.translate("key")` `selectTranslate("key")` `| transloco` |
-| **Laravel** | `__("key")` `trans("key")` `Lang::get("key")` `@lang("key")` |
-| **Flutter (gen_l10n)** | `AppLocalizations.of(context)!.key` |
-| **easy_localization** | `'key'.tr()` `tr('key')` `context.tr('key')` |
-| **flutter_i18n** | `FlutterI18n.translate(context, 'key')` `I18nText('key')` |
-| **GetX** | `'key'.tr` `'key'.trParams({})` |
-| **Custom** | Configure your own patterns! |
-
-## 🧩 Supported Languages
-
-- TypeScript / TSX
-- JavaScript / JSX
-- HTML
-- Angular templates
-- PHP
-- Blade
-- Dart (Flutter)
-- Vue.js
-
-## ⚙️ Configuration
+## Configuration
 
 Create `.zed/i18n.json` in your project root:
 
@@ -139,34 +107,27 @@ Create `.zed/i18n.json` in your project root:
 }
 ```
 
-<details>
-<summary><strong>📋 All Options</strong></summary>
+### All Options
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `localeDirNames` | `string[]` | `["locales"]` | Locale directory names searched upward inside package boundary |
-| `locales` | `string[]` | `["zh-CN", "zh-HK", "en"]` | Locale list used by hover/diagnostics/completion |
-| `sourceLocale` | `string` | `"en"` | Your primary language |
-| `displayLocale` | `string` | `"en"` | Locale used for inlay hints and completion details |
+| `localeDirNames` | `string[]` | `["locales"]` | Directory names to search upward within the package boundary |
+| `locales` | `string[]` | `["zh-CN", "zh-HK", "en"]` | Locale list for hover/diagnostics/completion |
+| `sourceLocale` | `string` | `"en"` | Primary language |
+| `displayLocale` | `string` | `"en"` | Locale shown in inlay hints and completion details |
 | `keyStyle` | `"nested" \| "flat"` | `"flat"` | Translation key style |
 | `functionNames` | `string[]` | `["t", "tt"]` | Function names to detect as translation calls |
-| `monorepoDetectors` | `string[]` | `["yarn.lock", "pnpm-workspace.yaml", "lerna.json"]` | Stop markers when package root is missing |
-| `maxWalkDepth` | `number` | `10` | Safety limit for upward directory traversal |
+| `monorepoDetectors` | `string[]` | `["yarn.lock", "pnpm-workspace.yaml", "lerna.json"]` | Fallback stop markers when no `package.json` is found |
+| `maxWalkDepth` | `number` | `10` | Max upward directory traversal depth |
 
-</details>
+### How locale resolution works
 
-<details>
-<summary><strong>🔧 Custom Function Names</strong></summary>
+1. Starting from the current file, walk upward to find the nearest `package.json` — this is the **package root**
+2. Within that scope, search upward for a directory matching any name in `localeDirNames`
+3. If no `package.json` is found, fall back to `monorepoDetectors` (e.g. `yarn.lock`) as the stop boundary
+4. Results are cached per file path for performance
 
-```json
-{
-  "functionNames": ["t", "tt", "translate"]
-}
-```
-
-</details>
-
-## 📁 Supported File Formats
+## Supported File Formats
 
 | Format | Extensions |
 |--------|------------|
@@ -175,35 +136,7 @@ Create `.zed/i18n.json` in your project root:
 | PHP | `.php` |
 | ARB (Flutter) | `.arb` |
 
-**Nested structure:**
-```
-locales/
-├── en/
-│   └── common.json
-├── vi/
-│   └── common.json
-└── ja/
-    └── common.json
-```
-
-**Or flat structure:**
-```
-locales/
-├── en.json
-├── vi.json
-└── ja.json
-```
-
-**Flutter ARB structure:**
-```
-lib/
-└── l10n/
-    ├── app_en.arb
-    ├── app_es.arb
-    └── app_vi.arb
-```
-
-## 🛠️ Development
+## Development
 
 ```bash
 cargo test          # Run tests
@@ -214,34 +147,18 @@ cargo build -r      # Release build
 RUST_LOG=debug ./target/release/scope-i18n-lens
 ```
 
-## 🤝 Contributing
+## Credits
 
-Contributions are welcome! Here's how:
+This project is forked from [intl-lens](https://github.com/nguyenphutrong/intl-lens) by [Trong Nguyen](https://github.com/nguyenphutrong). The original project provides the core LSP infrastructure and multi-language i18n key detection.
 
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feat/amazing-feature`)
-3. Commit your changes (`git commit -m 'feat: add amazing feature'`)
-4. Push to the branch (`git push origin feat/amazing-feature`)
-5. Open a Pull Request
+## License
 
-### Ideas for Contribution
-
-- [ ] Extract hardcoded strings to translation files
-- [ ] Support for more file formats (TOML, PO)
-- [ ] Namespace support for large projects
-- [ ] Translation file validation
-- [ ] Integration with translation services
-
-## 📄 License
-
-MIT © [Trong Nguyen](https://github.com/nguyenphutrong)
+MIT
 
 ---
 
 <div align="center">
 
-**If this project helps you, consider giving it a ⭐**
-
-[Report Bug](https://github.com/BigHuang/scope-i18n-lens/issues) · [Request Feature](https://github.com/BigHuang/scope-i18n-lens/issues)
+[Report Bug](https://github.com/RebelBIrd/scope-i18n-lens/issues) · [Request Feature](https://github.com/RebelBIrd/scope-i18n-lens/issues)
 
 </div>

@@ -1,0 +1,140 @@
+name: Auto Version and Release
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Target version (for example 0.2.0 or v0.2.0)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: auto-version-release-master
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.bump.outputs.should_release }}
+      version: ${{ steps.bump.outputs.version }}
+      bump_type: ${{ steps.bump.outputs.bump_type }}
+      release_tag: ${{ steps.bump.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: master
+
+      - name: Determine bump type and bump version
+        id: bump
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CURRENT_VERSION="$(sed -nE 's/^version = "([0-9]+\.[0-9]+\.[0-9]+)"$/\1/p' crates/intl-lens-extension/extension.toml | head -n1)"
+
+          if [ -z "$CURRENT_VERSION" ]; then
+            echo "Failed to read current version from extension.toml"
+            exit 1
+          fi
+
+          EVENT_NAME='${{ github.event_name }}'
+          NEW_VERSION=""
+          BUMP_TYPE="none"
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            RAW_VERSION='${{ inputs.version }}'
+            NEW_VERSION="${RAW_VERSION#v}"
+            BUMP_TYPE="manual"
+
+            if [[ ! "$NEW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "Invalid manual version: $RAW_VERSION"
+              exit 1
+            fi
+          else
+            BEFORE='${{ github.event.before }}'
+            AFTER='${{ github.sha }}'
+
+            if [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+              RANGE="$AFTER"
+            else
+              RANGE="$BEFORE..$AFTER"
+            fi
+
+            COMMIT_SUBJECTS="$(git log --format=%s $RANGE || true)"
+
+            echo "Commits in range:"
+            echo "$COMMIT_SUBJECTS"
+
+            if echo "$COMMIT_SUBJECTS" | grep -Eiq '^feat(\(.+\))?!?: '; then
+              BUMP_TYPE="minor"
+            elif echo "$COMMIT_SUBJECTS" | grep -Eiq '^fix(\(.+\))?!?: '; then
+              BUMP_TYPE="patch"
+            fi
+
+            if [ "$BUMP_TYPE" = "none" ]; then
+              echo "No feat/fix commit found, skipping release."
+              echo "should_release=false" >> "$GITHUB_OUTPUT"
+              echo "bump_type=none" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT_VERSION"
+
+            if [ "$BUMP_TYPE" = "minor" ]; then
+              MINOR=$((MINOR + 1))
+              PATCH=0
+            else
+              PATCH=$((PATCH + 1))
+            fi
+
+            NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          fi
+
+          NEW_TAG="v${NEW_VERSION}"
+
+          if [ "$NEW_VERSION" = "$CURRENT_VERSION" ]; then
+            echo "Version unchanged: $NEW_VERSION"
+          fi
+
+          sed -i -E '0,/^version = "[0-9]+\.[0-9]+\.[0-9]+"$/s//version = "'"$NEW_VERSION"'"/' Cargo.toml
+          sed -i -E 's/^version = "[0-9]+\.[0-9]+\.[0-9]+"$/version = "'"$NEW_VERSION"'"/' crates/intl-lens-extension/extension.toml
+
+          if git diff --quiet; then
+            echo "No version change produced, skipping."
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            echo "bump_type=none" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add Cargo.toml crates/intl-lens-extension/extension.toml
+          git commit -m "chore(release): bump version to ${NEW_TAG}"
+          git tag "${NEW_TAG}"
+
+          git push origin HEAD:master --follow-tags
+
+          echo "should_release=true" >> "$GITHUB_OUTPUT"
+          echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+          echo "bump_type=$BUMP_TYPE" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$NEW_TAG" >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: bump
+    if: needs.bump.outputs.should_release == 'true'
+    uses: ./.github/workflows/release.yml
+    with:
+      version: ${{ needs.bump.outputs.version }}
+    secrets: inherit
