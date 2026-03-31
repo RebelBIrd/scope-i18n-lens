@@ -22,7 +22,25 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Build
+        run: cargo build --all-targets
+      - name: Test
+        run: cargo test --all-targets
+
   bump:
+    needs: check
     runs-on: ubuntu-latest
     outputs:
       should_release: ${{ steps.bump.outputs.should_release }}
