@@ -95,9 +95,7 @@ impl LocaleResolver {
                 return None;
             }
 
-            let Some(parent) = cursor.parent() else {
-                return None;
-            };
+            let parent = cursor.parent()?;
             cursor = parent;
         }
     }

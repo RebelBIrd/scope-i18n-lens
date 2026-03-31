@@ -307,14 +307,14 @@ impl I18nBackend {
         if let Some(source_location) =
             store.get_translation_location(locale_dir, key, &config.source_locale)
         {
-            content.push_str("\n");
+            content.push('\n');
             content.push_str(&format!("Path: {}\n", source_location.file_path.display()));
         }
 
         let placeholders =
             Self::collect_placeholders(translations.values().map(|entry| entry.value.as_str()));
         if !placeholders.is_empty() {
-            content.push_str("\n");
+            content.push('\n');
             content.push_str(&format!("Placeholders: {}\n", placeholders.join(", ")));
         }
 
